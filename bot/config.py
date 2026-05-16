@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     MONTH_PRICE: int = 49900
     THREE_MONTHS_PRICE: int = 129000
     PROVIDER_TOKEN: str = ""
+    YOOKASSA_SHOP_ID: str = ""
+    YOOKASSA_SECRET_KEY: str = ""
+    WEBAPP_HOST: str = "0.0.0.0"
+    WEBAPP_PORT: int = 8080
 
     @field_validator("ADMIN_IDS", mode="before")
     @classmethod

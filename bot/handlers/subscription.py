@@ -3,6 +3,7 @@ from datetime import datetime
 
 from aiogram import Router, types, F
 from aiogram.filters import Command
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
 from bot.config import settings
@@ -38,70 +39,113 @@ async def btn_subscribe(message: types.Message) -> None:
 @router.callback_query(F.data == "sub_1m")
 async def sub_1m(callback: types.CallbackQuery) -> None:
     await callback.answer()
-    await _send_invoice(callback.from_user.id, "1m", "Подписка на 1 месяц", settings.MONTH_PRICE, 30)
+    await _create_yookassa_payment(
+        callback.from_user.id, "1m", "Подписка на 1 месяц",
+        settings.MONTH_PRICE / 100, 30,
+    )
 
 
 @router.callback_query(F.data == "sub_3m")
 async def sub_3m(callback: types.CallbackQuery) -> None:
     await callback.answer()
-    await _send_invoice(callback.from_user.id, "3m", "Подписка на 3 месяца", settings.THREE_MONTHS_PRICE, 90)
-
-
-async def _send_invoice(user_id: int, sub_type: str, title: str, amount: int, days: int) -> None:
-    from aiogram import Bot
-    from aiogram.types import LabeledPrice
-
-    bot = Bot.get_current()
-
-    prices = [LabeledPrice(label=title, amount=amount)]
-    await bot.send_invoice(
-        chat_id=user_id,
-        title=title,
-        description=f"Доступ к анализу фото еды на {days} дней",
-        prices=prices,
-        provider_token=settings.PROVIDER_TOKEN,
-        payload=f"sub_{sub_type}_{user_id}",
-        currency="RUB",
+    await _create_yookassa_payment(
+        callback.from_user.id, "3m", "Подписка на 3 месяца",
+        settings.THREE_MONTHS_PRICE / 100, 90,
     )
 
 
-@router.pre_checkout_query()
-async def pre_checkout(query: types.PreCheckoutQuery) -> None:
-    await query.answer(ok=True)
+async def _create_yookassa_payment(
+    user_id: int, sub_type: str, description: str, amount_rub: float, days: int,
+) -> None:
+    from bot.services.yookassa import create_payment
 
+    result = await create_payment(
+        user_id=user_id,
+        sub_type=sub_type,
+        amount_rub=amount_rub,
+        description=description,
+    )
 
-@router.message(F.successful_payment)
-async def successful_payment(message: types.Message) -> None:
-    payment_info = message.successful_payment
-    payload = payment_info.invoice_payload
+    bot = __import__("aiogram").Bot.get_current()
 
-    if not payload.startswith("sub_"):
-        await message.answer("Ошибка обработки платежа. Обратитесь в поддержку.")
+    if not result:
+        await bot.send_message(
+            user_id,
+            "❌ Не удалось создать платёж. Попробуйте позже или обратитесь в поддержку.",
+        )
         return
-
-    parts = payload.split("_")
-    sub_type = parts[1]
-    user_id = message.from_user.id
-
-    duration_days = 30 if sub_type == "1m" else 90
 
     async with async_session() as session:
         payment = Payment(
             user_id=user_id,
-            amount=payment_info.total_amount,
-            currency=payment_info.currency,
+            amount=int(amount_rub * 100),
+            currency="RUB",
             sub_type=sub_type,
-            telegram_payment_id=payment_info.telegram_payment_charge_id,
-            status="success",
+            telegram_payment_id=result["payment_id"],
+            status="pending",
         )
         session.add(payment)
-        await activate_subscription(session, user_id, sub_type, duration_days)
+        await session.commit()
 
-    await message.answer(
-        "✅ Оплата прошла успешно! Подписка активирована.\n\n"
-        "📸 Теперь вы можете отправлять фото еды для анализа.",
-        reply_markup=main_menu_keyboard(),
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить", url=result["confirmation_url"])],
+        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"paycheck_{result['payment_id']}")],
+    ])
+
+    await bot.send_message(
+        user_id,
+        f"📋 <b>{description}</b>\n\n"
+        f"Сумма: {amount_rub:.0f} ₽\n\n"
+        f"Нажмите кнопку ниже для перехода к оплате.\n"
+        f"После оплаты нажмите «Проверить оплату».",
+        reply_markup=kb,
+        parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("paycheck_"))
+async def check_payment(callback: types.CallbackQuery) -> None:
+    await callback.answer()
+    payment_id = callback.data.removeprefix("paycheck_")
+
+    from bot.services.yookassa import get_payment_info
+
+    info = await get_payment_info(payment_id)
+    if not info:
+        await callback.message.answer("Не удалось проверить статус платежа. Попробуйте позже.")
+        return
+
+    if info.get("status") == "succeeded" and info.get("paid"):
+        metadata = info.get("metadata", {})
+        user_id = int(metadata.get("user_id", 0))
+        sub_type = metadata.get("sub_type", "")
+
+        if user_id != callback.from_user.id:
+            await callback.message.answer("Ошибка: платёж не ваш.")
+            return
+
+        duration_days = 30 if sub_type == "1m" else 90
+
+        async with async_session() as session:
+            result = await session.execute(
+                select(Payment).where(Payment.telegram_payment_id == payment_id)
+            )
+            payment = result.scalar_one_or_none()
+            if payment and payment.status != "success":
+                payment.status = "success"
+                await activate_subscription(session, user_id, sub_type, duration_days)
+
+        await callback.message.answer(
+            "✅ Оплата прошла успешно! Подписка активирована.\n\n"
+            "📸 Теперь вы можете отправлять фото еды для анализа.",
+            reply_markup=main_menu_keyboard(),
+        )
+    elif info.get("status") == "canceled":
+        await callback.message.answer("❌ Платёж отменён.")
+    else:
+        await callback.message.answer(
+            "⏳ Платёж ещё не завершён. Нажмите «Проверить оплату» после оплаты."
+        )
 
 
 @router.callback_query(F.data == "sub_check")
